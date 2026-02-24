@@ -14,3 +14,19 @@ Steps:
 Only adjust parameters if the user asks:
 - `max_duration`: increase for longer dictations (default: 30s, max: 120s)
 - `silence_duration`: increase if the user pauses often while speaking (default: 2s)
+
+## PTT (Push-to-Talk) mode
+
+For longer dictations where the user wants to compose in multiple bursts, the user runs the PTT daemon in a separate terminal:
+
+```
+python3 ~/.claude/mcp-servers/claude-stt/ptt.py
+```
+
+The daemon records each segment while Right Option (⌥) is held, transcribes on release, and appends to a shared session file. The user may repeat as many times as needed.
+
+When the user says "read my dictation" or similar:
+1. Call `get_session` — returns the full accumulated text (clears session by default)
+2. Show the transcript and ask how they'd like to use it
+
+To discard without reading: call `clear_session`.

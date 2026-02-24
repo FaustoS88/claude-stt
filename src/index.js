@@ -2,12 +2,14 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { spawn } from "node:child_process";
-import { unlink, mkdtemp, access, rmdir } from "node:fs/promises";
+import { unlink, mkdtemp, access, rmdir, readFile } from "node:fs/promises";
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 import { constants } from "node:fs";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
+
+const SESSION_FILE = join(homedir(), ".claude", "mcp-servers", "claude-stt", "session.txt");
 
 const DEFAULT_MODEL_PATH = join(
   homedir(),
@@ -212,6 +214,69 @@ server.registerTool(
     } finally {
       try { await unlink(wavPath); } catch { /* ignore */ }
       try { await rmdir(tempDir); } catch { /* ignore */ }
+    }
+  }
+);
+
+// ─── Tool: get_session ───────────────────────────────────────────────────────
+
+server.registerTool(
+  "get_session",
+  {
+    title: "Get PTT Session",
+    description:
+      "Read the accumulated push-to-talk dictation session recorded by the PTT daemon (ptt.py). " +
+      "Returns all text spoken since the last clear. By default clears the session after reading.",
+    inputSchema: {
+      clear: z
+        .boolean()
+        .default(true)
+        .describe("Clear the session after reading (default: true)"),
+    },
+  },
+  async ({ clear }) => {
+    let text;
+    try {
+      text = (await readFile(SESSION_FILE, "utf8")).trim();
+    } catch (err) {
+      if (err.code === "ENOENT") {
+        return { content: [{ type: "text", text: "Session is empty." }] };
+      }
+      return errorResult(`Could not read session file: ${err.message}`);
+    }
+
+    if (!text) {
+      return { content: [{ type: "text", text: "Session is empty." }] };
+    }
+
+    if (clear) {
+      try {
+        await unlink(SESSION_FILE);
+      } catch { /* ignore — file may have already been removed */ }
+    }
+
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+// ─── Tool: clear_session ─────────────────────────────────────────────────────
+
+server.registerTool(
+  "clear_session",
+  {
+    title: "Clear PTT Session",
+    description: "Delete the accumulated push-to-talk dictation session (session.txt). Use this to reset after reading.",
+    inputSchema: {},
+  },
+  async () => {
+    try {
+      await unlink(SESSION_FILE);
+      return { content: [{ type: "text", text: "Session cleared." }] };
+    } catch (err) {
+      if (err.code === "ENOENT") {
+        return { content: [{ type: "text", text: "Session was already empty." }] };
+      }
+      return errorResult(`Could not clear session: ${err.message}`);
     }
   }
 );
