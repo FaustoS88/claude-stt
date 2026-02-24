@@ -20,8 +20,8 @@ const DEFAULT_MODEL_PATH = join(
   "ggml-base.en.bin"
 );
 const DEFAULT_MAX_DURATION = 30;    // seconds
-const DEFAULT_SILENCE_DURATION = 2; // seconds
-const SILENCE_THRESHOLD = "0.5%";   // sox amplitude threshold for silence detection
+const DEFAULT_SILENCE_DURATION = 3; // seconds
+const SILENCE_THRESHOLD = "0.1%";   // sox amplitude threshold for silence detection
 
 
 // ─── MCP Server ──────────────────────────────────────────────────────────────
