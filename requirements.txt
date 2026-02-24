@@ -1,0 +1,3 @@
+pynput>=1.7.0
+pyaudio>=0.2.11
+pyperclip>=1.8.0
