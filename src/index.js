@@ -21,6 +21,7 @@ const DEFAULT_MAX_DURATION = 30;    // seconds
 const DEFAULT_SILENCE_DURATION = 2; // seconds
 const SILENCE_THRESHOLD = "1.0%";   // sox amplitude threshold for silence detection
 
+
 // ─── MCP Server ──────────────────────────────────────────────────────────────
 
 const server = new McpServer({
@@ -30,16 +31,22 @@ const server = new McpServer({
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-function whichBinary(name) {
+// Resolve binary path, searching standard Homebrew locations in addition to PATH
+// This ensures the server works even when Claude Code spawns it with a minimal PATH
+const SEARCH_PATHS = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"];
+
+async function resolveBinary(name) {
+  // First try `which` with the extended search paths
   return new Promise((resolve) => {
-    const proc = spawn("which", [name]);
+    const env = { ...process.env, PATH: SEARCH_PATHS.join(":") };
+    const proc = spawn("which", [name], { env });
     let out = "";
     proc.stdout.on("data", (d) => (out += d.toString()));
     proc.on("close", (code) => resolve(code === 0 ? out.trim() : null));
   });
 }
 
-function recordAudio(outputPath, { maxDuration, silenceDuration }) {
+function recordAudio(recBin, outputPath, { maxDuration, silenceDuration }) {
   return new Promise((resolve, reject) => {
     // rec is the sox recording alias: records from the default macOS audio device
     // Audio format: 16kHz mono 16-bit — exactly what whisper-cpp requires
@@ -58,7 +65,7 @@ function recordAudio(outputPath, { maxDuration, silenceDuration }) {
       "trim", "0", String(maxDuration),
     ];
 
-    const proc = spawn("rec", args, { stdio: ["ignore", "ignore", "pipe"] });
+    const proc = spawn(recBin, args, { stdio: ["ignore", "ignore", "pipe"] });
 
     let stderr = "";
     proc.stderr.on("data", (d) => (stderr += d.toString()));
@@ -76,12 +83,12 @@ function recordAudio(outputPath, { maxDuration, silenceDuration }) {
 
     proc.on("error", (err) => {
       clearTimeout(timeout);
-      reject(new Error(`Failed to start rec: ${err.message}. Is sox installed? Run: brew install sox`));
+      reject(new Error(`Failed to start rec (${recBin}): ${err.message}. Is sox installed? Run: brew install sox`));
     });
   });
 }
 
-function transcribeAudio(wavPath, modelPath) {
+function transcribeAudio(whisperBin, wavPath, modelPath) {
   return new Promise((resolve, reject) => {
     const args = [
       "-m", modelPath,
@@ -90,7 +97,7 @@ function transcribeAudio(wavPath, modelPath) {
       "-l", "en",
     ];
 
-    const proc = spawn("whisper-cpp", args, { stdio: ["ignore", "pipe", "pipe"] });
+    const proc = spawn(whisperBin, args, { stdio: ["ignore", "pipe", "pipe"] });
 
     let stdout = "";
     let stderr = "";
@@ -119,7 +126,7 @@ function transcribeAudio(wavPath, modelPath) {
 
     proc.on("error", (err) => {
       reject(new Error(
-        `Failed to start whisper-cpp: ${err.message}. Is it installed? Run: brew install whisper-cpp`
+        `Failed to start whisper-cli (${whisperBin}): ${err.message}. Is it installed? Run: brew install whisper-cpp`
       ));
     });
   });
@@ -159,12 +166,14 @@ server.registerTool(
     },
   },
   async ({ max_duration, silence_duration, model_path }) => {
-    // Preflight checks
-    if (!(await whichBinary("rec"))) {
+    // Preflight checks — resolve full binary paths to avoid PATH issues
+    const recBin = await resolveBinary("rec");
+    if (!recBin) {
       return errorResult("'rec' (sox) not found. Install with: brew install sox");
     }
-    if (!(await whichBinary("whisper-cpp"))) {
-      return errorResult("'whisper-cpp' not found. Install with: brew install whisper-cpp");
+    const whisperBin = await resolveBinary("whisper-cli");
+    if (!whisperBin) {
+      return errorResult("'whisper-cli' not found. Install with: brew install whisper-cpp");
     }
     try {
       await access(model_path, constants.R_OK);
@@ -189,10 +198,10 @@ server.registerTool(
 
     try {
       console.error(`[claude-stt] Recording (max ${max_duration}s, silence stop: ${silence_duration}s)...`);
-      await recordAudio(wavPath, { maxDuration: max_duration, silenceDuration: silence_duration });
+      await recordAudio(recBin, wavPath, { maxDuration: max_duration, silenceDuration: silence_duration });
       console.error("[claude-stt] Transcribing...");
 
-      const transcript = await transcribeAudio(wavPath, model_path);
+      const transcript = await transcribeAudio(whisperBin, wavPath, model_path);
       console.error(`[claude-stt] Done — ${transcript.length} chars`);
 
       return {

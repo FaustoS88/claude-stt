@@ -32,11 +32,11 @@ else
   echo "  sox ✓"
 fi
 
-if ! command -v whisper-cpp &>/dev/null; then
+if ! command -v whisper-cli &>/dev/null; then
   echo "  Installing whisper-cpp..."
   brew install whisper-cpp
 else
-  echo "  whisper-cpp ✓"
+  echo "  whisper-cli ✓"
 fi
 
 if ! command -v node &>/dev/null; then
@@ -86,8 +86,7 @@ claude mcp remove claude-stt --scope user 2>/dev/null || true
 
 claude mcp add \
   --transport stdio \
-  --scope user \
-  -e "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" \
+  -s user \
   claude-stt \
   -- node "$MCP_TARGET/index.js"
 
