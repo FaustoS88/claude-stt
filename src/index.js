@@ -3,9 +3,10 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { spawn } from "node:child_process";
 import { unlink, mkdtemp, access, rmdir, readFile } from "node:fs/promises";
-import { tmpdir, homedir } from "node:os";
-import { join } from "node:path";
+import { tmpdir, homedir, platform } from "node:os";
+import { join, delimiter } from "node:path";
 import { constants } from "node:fs";
+import { execSync } from "node:child_process";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -23,49 +24,91 @@ const DEFAULT_MAX_DURATION = 30;    // seconds
 const DEFAULT_SILENCE_DURATION = 3; // seconds
 const SILENCE_THRESHOLD = "0.1%";   // sox amplitude threshold for silence detection
 
+const IS_WIN = platform() === "win32";
+const IS_MAC = platform() === "darwin";
 
 // ─── MCP Server ──────────────────────────────────────────────────────────────
 
 const server = new McpServer({
   name: "claude-stt",
-  version: "1.0.0",
+  version: "1.1.0",
 });
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-// Resolve binary path, searching standard Homebrew locations in addition to PATH
-// This ensures the server works even when Claude Code spawns it with a minimal PATH
-const SEARCH_PATHS = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"];
+// Extend PATH with common install locations (macOS Homebrew, Linux local bin)
+function extendPath() {
+  const extras = IS_MAC
+    ? ["/opt/homebrew/bin", "/usr/local/bin"]
+    : IS_WIN
+    ? []
+    : ["/usr/local/bin", join(homedir(), ".local", "bin")];
+  const current = process.env.PATH || "";
+  for (const d of extras) {
+    if (!current.includes(d)) {
+      process.env.PATH = d + delimiter + process.env.PATH;
+    }
+  }
+}
 
+// Cross-platform binary resolution using `which` (Unix) or `where` (Windows)
 async function resolveBinary(name) {
-  // First try `which` with the extended search paths
   return new Promise((resolve) => {
-    const env = { ...process.env, PATH: SEARCH_PATHS.join(":") };
-    const proc = spawn("which", [name], { env });
+    const cmd = IS_WIN ? "where" : "which";
+    const proc = spawn(cmd, [name], { env: process.env });
     let out = "";
     proc.stdout.on("data", (d) => (out += d.toString()));
-    proc.on("close", (code) => resolve(code === 0 ? out.trim() : null));
+    proc.on("close", (code) => resolve(code === 0 ? out.trim().split(/\r?\n/)[0] : null));
+    proc.on("error", () => resolve(null));
   });
 }
 
+// Try multiple candidate names for a binary
+async function resolveAnyBinary(names) {
+  for (const name of names) {
+    const path = await resolveBinary(name);
+    if (path) return path;
+  }
+  return null;
+}
+
+function soxInstallHint() {
+  if (IS_MAC) return "brew install sox";
+  if (IS_WIN) return "choco install sox  OR  download from https://sox.sourceforge.net/";
+  return "sudo apt install sox  OR  your distro's package manager";
+}
+
+function whisperInstallHint() {
+  if (IS_MAC) return "brew install whisper-cpp";
+  if (IS_WIN) return "Download from: https://github.com/ggml-org/whisper.cpp/releases";
+  return "Build from source: https://github.com/ggml-org/whisper.cpp";
+}
+
+// Sox recording binary is `rec` on macOS/Linux, `sox` with `-d` flag on Windows
 function recordAudio(recBin, outputPath, { maxDuration, silenceDuration }) {
   return new Promise((resolve, reject) => {
-    // rec is the sox recording alias: records from the default macOS audio device
-    // Audio format: 16kHz mono 16-bit — exactly what whisper-cpp requires
-    // silence effect:
-    //   1 0.1 <threshold>              — skip leading silence (start only after sound detected)
-    //   1 <silenceDuration> <threshold> — auto-stop after N seconds below threshold
-    // trim 0 <maxDuration>             — hard cap on total recording length
-    const args = [
-      "-r", "16000",
-      "-c", "1",
-      "-b", "16",
-      outputPath,
-      "silence",
-      "1", "0.1", SILENCE_THRESHOLD,
-      "1", String(silenceDuration), SILENCE_THRESHOLD,
-      "trim", "0", String(maxDuration),
-    ];
+    let args;
+    if (IS_WIN) {
+      // On Windows, sox uses `-d` (default device) instead of the `rec` alias
+      args = [
+        "-d",
+        "-r", "16000", "-c", "1", "-b", "16",
+        outputPath,
+        "silence",
+        "1", "0.1", SILENCE_THRESHOLD,
+        "1", String(silenceDuration), SILENCE_THRESHOLD,
+        "trim", "0", String(maxDuration),
+      ];
+    } else {
+      args = [
+        "-r", "16000", "-c", "1", "-b", "16",
+        outputPath,
+        "silence",
+        "1", "0.1", SILENCE_THRESHOLD,
+        "1", String(silenceDuration), SILENCE_THRESHOLD,
+        "trim", "0", String(maxDuration),
+      ];
+    }
 
     const proc = spawn(recBin, args, { stdio: ["ignore", "ignore", "pipe"] });
 
@@ -85,7 +128,10 @@ function recordAudio(recBin, outputPath, { maxDuration, silenceDuration }) {
 
     proc.on("error", (err) => {
       clearTimeout(timeout);
-      reject(new Error(`Failed to start rec (${recBin}): ${err.message}. Is sox installed? Run: brew install sox`));
+      reject(new Error(
+        `Failed to start recording (${recBin}): ${err.message}. ` +
+        `Is sox installed? ${soxInstallHint()}`
+      ));
     });
   });
 }
@@ -130,7 +176,8 @@ function transcribeAudio(whisperBin, wavPath, modelPath) {
 
     proc.on("error", (err) => {
       reject(new Error(
-        `Failed to start whisper-cli (${whisperBin}): ${err.message}. Is it installed? Run: brew install whisper-cpp`
+        `Failed to start whisper-cli (${whisperBin}): ${err.message}. ` +
+        `Is it installed? ${whisperInstallHint()}`
       ));
     });
   });
@@ -147,7 +194,7 @@ server.registerTool(
   {
     title: "Dictate",
     description:
-      "Record speech from the macOS microphone and transcribe it to text using local whisper-cpp. " +
+      "Record speech from the microphone and transcribe it to text using local whisper-cpp. " +
       "Recording starts immediately and auto-stops after a silence period. " +
       "Fully local — no audio data leaves the device.",
     inputSchema: {
@@ -170,14 +217,17 @@ server.registerTool(
     },
   },
   async ({ max_duration, silence_duration, model_path }) => {
-    // Preflight checks — resolve full binary paths to avoid PATH issues
-    const recBin = await resolveBinary("rec");
+    extendPath();
+
+    // On Windows, sox is both the recorder and player; on Unix, `rec` is the recording alias
+    const recCandidates = IS_WIN ? ["sox"] : ["rec"];
+    const recBin = await resolveAnyBinary(recCandidates);
     if (!recBin) {
-      return errorResult("'rec' (sox) not found. Install with: brew install sox");
+      return errorResult(`'${recCandidates[0]}' (sox) not found. Install with: ${soxInstallHint()}`);
     }
-    const whisperBin = await resolveBinary("whisper-cli");
+    const whisperBin = await resolveAnyBinary(["whisper-cli", "whisper-cpp", "whisper", "main"]);
     if (!whisperBin) {
-      return errorResult("'whisper-cli' not found. Install with: brew install whisper-cpp");
+      return errorResult(`whisper-cpp not found. Install with: ${whisperInstallHint()}`);
     }
     try {
       await access(model_path, constants.R_OK);

@@ -2,9 +2,9 @@
 """
 claude-stt PTT daemon — Push-to-Talk mode.
 
-Hold Right Option (⌥) to record, release to stop and transcribe.
+Hold Right Option/Alt to record, release to stop and transcribe.
 Each segment is appended to session.txt and copied to the clipboard.
-Paste (Cmd+V) directly into Claude Code.
+Paste (Cmd+V / Ctrl+V) directly into Claude Code.
 
 Commands (type in terminal):
     c / clear   — clear session and clipboard, start fresh
@@ -15,40 +15,80 @@ Usage:
     python3 ~/.claude/mcp-servers/claude-stt/ptt.py
 
 Requirements:
-    brew install sox whisper-cpp
-    pip3 install pynput
-    Terminal must have Accessibility permission (System Settings > Privacy > Accessibility)
+    pip3 install pynput pyaudio pyperclip
+    whisper-cpp must be on PATH
+    macOS: Terminal needs Accessibility permission (System Settings > Privacy > Accessibility)
+
+Cross-platform: macOS, Windows, Linux (X11)
 """
 
 import os
+import platform
+import queue
+import re
+import shutil
 import sys
 import subprocess
 import tempfile
 import threading
+import wave
 from pathlib import Path
 
+import pyaudio
+import pyperclip
 from pynput import keyboard
+
+# ─── Platform detection ──────────────────────────────────────────────────────
+
+SYSTEM = platform.system()  # "Darwin", "Windows", "Linux"
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
-MODEL_PATH = SCRIPT_DIR / "models" / "ggml-base.en.bin"
+INSTALL_DIR = Path.home() / ".claude" / "mcp-servers" / "claude-stt"
+# Check installed location first, fall back to script-relative
+_model_installed = INSTALL_DIR / "models" / "ggml-base.en.bin"
+_model_local = SCRIPT_DIR / "models" / "ggml-base.en.bin"
+MODEL_PATH = _model_installed if _model_installed.exists() else _model_local
 SESSION_FILE = Path.home() / ".claude" / "mcp-servers" / "claude-stt" / "session.txt"
 
 # ─── Startup checks ──────────────────────────────────────────────────────────
 
-def check_binary(name):
-    search = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
-    for d in search:
-        p = Path(d) / name
-        if p.exists():
-            return str(p)
-    print(f"ERROR: '{name}' not found.")
-    if name == "rec":
-        print("  Fix: brew install sox")
-    elif name == "whisper-cli":
-        print("  Fix: brew install whisper-cpp")
-    sys.exit(1)
+def extend_path():
+    """Ensure common install locations are on PATH."""
+    if SYSTEM == "Darwin":
+        extras = ["/opt/homebrew/bin", "/usr/local/bin"]
+    elif SYSTEM == "Linux":
+        extras = ["/usr/local/bin", str(Path.home() / ".local" / "bin")]
+    else:
+        extras = []
+    current = os.environ.get("PATH", "")
+    for d in extras:
+        if d not in current:
+            current = d + os.pathsep + current
+    os.environ["PATH"] = current
+
+def find_whisper_binary():
+    """Find the whisper-cpp binary across platforms."""
+    for name in ("whisper-cli", "whisper-cpp", "whisper", "main"):
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
+
+def whisper_install_hint():
+    if SYSTEM == "Darwin":
+        return "brew install whisper-cpp"
+    elif SYSTEM == "Linux":
+        return "Build from source: https://github.com/ggml-org/whisper.cpp"
+    else:
+        return "Download from: https://github.com/ggml-org/whisper.cpp/releases"
+
+def check_whisper(whisper_bin):
+    if not whisper_bin:
+        print("ERROR: whisper-cpp not found on PATH.")
+        print(f"  Fix: {whisper_install_hint()}")
+        sys.exit(1)
 
 def check_model():
     if not MODEL_PATH.exists():
@@ -57,19 +97,33 @@ def check_model():
         print(f"    'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin'")
         sys.exit(1)
 
-# ─── Clipboard ───────────────────────────────────────────────────────────────
+def check_pyaudio():
+    """Verify PyAudio can open an input stream (microphone available)."""
+    pa = pyaudio.PyAudio()
+    try:
+        info = pa.get_default_input_device_info()
+        if info is None:
+            print("ERROR: No default input device (microphone) found.")
+            sys.exit(1)
+    except (IOError, OSError):
+        print("ERROR: No input device (microphone) available.")
+        if SYSTEM == "Linux":
+            print("  Fix: sudo apt install portaudio19-dev python3-pyaudio")
+        sys.exit(1)
+    finally:
+        pa.terminate()
+
+# ─── Clipboard (cross-platform via pyperclip) ───────────────────────────────
 
 def copy_to_clipboard(text):
-    """Copy text to system clipboard (macOS pbcopy)."""
     try:
-        subprocess.run(["pbcopy"], input=text.encode(), check=True)
+        pyperclip.copy(text)
     except Exception:
         pass
 
 def clear_clipboard():
-    """Clear the system clipboard."""
     try:
-        subprocess.run(["pbcopy"], input=b"", check=True)
+        pyperclip.copy("")
     except Exception:
         pass
 
@@ -93,15 +147,62 @@ def clear_session():
     if SESSION_FILE.exists():
         SESSION_FILE.unlink()
     clear_clipboard()
-    print("\n✓ Session cleared — clipboard emptied. Ready for a fresh start.\n")
+    print("\n\u2713 Session cleared \u2014 clipboard emptied. Ready for a fresh start.\n")
     print("Session: (empty)\n")
 
-# ─── Audio pipeline ──────────────────────────────────────────────────────────
+# ─── Audio recording (cross-platform via PyAudio) ────────────────────────────
 
-def record_audio(rec_bin, wav_path):
-    """Spawn rec (sox) — raw recording, no silence detection."""
-    args = [rec_bin, "-r", "16000", "-c", "1", "-b", "16", wav_path]
-    return subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+RATE = 16000
+CHANNELS = 1
+CHUNK = 1024
+FORMAT = pyaudio.paInt16
+
+class Recorder:
+    """Records audio from the default input device using PyAudio.
+
+    Call start() to begin recording, stop() to finish and write a valid WAV.
+    """
+
+    def __init__(self, wav_path):
+        self.wav_path = wav_path
+        self._frames = queue.Queue()
+        self._pa = pyaudio.PyAudio()
+        self._stream = None
+
+    def start(self):
+        self._stream = self._pa.open(
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=RATE,
+            input=True,
+            frames_per_buffer=CHUNK,
+            stream_callback=self._callback,
+        )
+        self._stream.start_stream()
+
+    def _callback(self, in_data, frame_count, time_info, status):
+        self._frames.put(in_data)
+        return (None, pyaudio.paContinue)
+
+    def stop(self):
+        """Stop recording and write accumulated audio to WAV file."""
+        if self._stream is not None:
+            self._stream.stop_stream()
+            self._stream.close()
+        self._pa.terminate()
+        chunks = []
+        while not self._frames.empty():
+            chunks.append(self._frames.get())
+        if chunks:
+            with wave.open(self.wav_path, "wb") as wf:
+                wf.setnchannels(CHANNELS)
+                wf.setsampwidth(2)  # 16-bit = 2 bytes
+                wf.setframerate(RATE)
+                wf.writeframes(b"".join(chunks))
+
+# ─── Transcription ───────────────────────────────────────────────────────────
+
+WHISPER_ARTIFACT = re.compile(r"^\[.*\]$|^\(.*\)$")
 
 def transcribe_audio(whisper_bin, wav_path):
     """Run whisper-cli, return stripped transcript text."""
@@ -109,54 +210,62 @@ def transcribe_audio(whisper_bin, wav_path):
     result = subprocess.run(args, capture_output=True, text=True, timeout=60)
     if result.returncode != 0:
         raise RuntimeError(f"whisper-cli failed (code {result.returncode}): {result.stderr.strip()}")
-    lines = [l.strip() for l in result.stdout.split("\n") if l.strip()]
+    lines = [l.strip() for l in result.stdout.split("\n")
+             if l.strip() and not WHISPER_ARTIFACT.match(l.strip())]
     return " ".join(lines).strip()
+
+# ─── Platform-aware labels ───────────────────────────────────────────────────
+
+def ptt_key_label():
+    if SYSTEM == "Darwin":
+        return "Right Option (\u2325)"
+    return "Right Alt"
+
+def paste_shortcut():
+    if SYSTEM == "Darwin":
+        return "Cmd+V"
+    return "Ctrl+V"
 
 # ─── Main loop ───────────────────────────────────────────────────────────────
 
-def run(rec_bin, whisper_bin):
-    # Always start fresh
+def run(whisper_bin):
     if SESSION_FILE.exists():
         SESSION_FILE.unlink()
 
-    print("claude-stt PTT — hold Right Option (⌥) to record, release to stop")
-    print("Type 'c' to clear session  |  Ctrl+C to exit")
-    print("Transcript auto-copied to clipboard → Cmd+V to paste\n")
+    key_label = ptt_key_label()
+    paste_key = paste_shortcut()
+    print(f"claude-stt PTT \u2014 hold {key_label} to record, release to stop")
+    print(f"Type 'c' to clear session  |  Ctrl+C to exit")
+    print(f"Transcript auto-copied to clipboard \u2192 {paste_key} to paste\n")
     print("Session: (empty)\n")
 
-    # Shared state protected by a lock
     lock = threading.Lock()
-    state = {"recording": False, "proc": None, "wav_path": None}
+    state = {"recording": False, "recorder": None, "wav_path": None}
 
     def start_recording():
         fd, wav = tempfile.mkstemp(suffix=".wav", prefix="claude-stt-ptt-")
         os.close(fd)
         state["wav_path"] = wav
-        state["proc"] = record_audio(rec_bin, wav)
+        recorder = Recorder(wav)
+        recorder.start()
+        state["recorder"] = recorder
         state["recording"] = True
-        print("● RECORDING — release Right Option (⌥) to stop", flush=True)
+        print(f"\u25cf RECORDING \u2014 release {key_label} to stop", flush=True)
 
     def stop_and_transcribe():
-        proc = state["proc"]
+        recorder = state["recorder"]
         wav = state["wav_path"]
-        state["proc"] = None
+        state["recorder"] = None
         state["wav_path"] = None
         state["recording"] = False
 
-        # Stop recording
-        proc.terminate()
-        try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+        recorder.stop()
 
-        # Transcribe
         print("  Transcribing...", end="", flush=True)
         try:
             text = transcribe_audio(whisper_bin, wav)
         except Exception as e:
-            print(f"\r✗ Transcription error: {e}   ")
+            print(f"\r\u2717 Transcription error: {e}   ")
             text = None
         finally:
             try:
@@ -167,10 +276,10 @@ def run(rec_bin, whisper_bin):
         if text:
             session = append_session(text)
             copy_to_clipboard(session)
-            print(f'\r✓ "{text}"   ')
+            print(f'\r\u2713 "{text}"   ')
             print(f"\nSession (copied to clipboard): {session}\n")
         else:
-            print("\r✗ (no speech detected)   \n")
+            print("\r\u2717 (no speech detected)   \n")
 
     def on_press(key):
         try:
@@ -178,7 +287,7 @@ def run(rec_bin, whisper_bin):
                 if key == keyboard.Key.alt_r and not state["recording"]:
                     start_recording()
         except Exception as e:
-            print(f"\n✗ Key handler error: {e}", flush=True)
+            print(f"\n\u2717 Key handler error: {e}", flush=True)
 
     def on_release(key):
         try:
@@ -186,14 +295,12 @@ def run(rec_bin, whisper_bin):
                 if key == keyboard.Key.alt_r and state["recording"]:
                     stop_and_transcribe()
         except Exception as e:
-            print(f"\n✗ Key handler error: {e}", flush=True)
+            print(f"\n\u2717 Key handler error: {e}", flush=True)
 
-    # Start global key listener in daemon thread
     listener = keyboard.Listener(on_press=on_press, on_release=on_release)
     listener.daemon = True
     listener.start()
 
-    # Main thread: read stdin for commands
     try:
         while True:
             try:
@@ -209,18 +316,16 @@ def run(rec_bin, whisper_bin):
             elif cmd in ("q", "quit", "exit"):
                 break
             elif cmd:
-                print(f"  Unknown command: '{cmd}' — type 'c' to clear, 'q' to quit")
+                print(f"  Unknown command: '{cmd}' \u2014 type 'c' to clear, 'q' to quit")
     except KeyboardInterrupt:
         pass
     finally:
-        # Cleanup if interrupted mid-recording
         with lock:
-            if state["proc"] is not None:
-                state["proc"].terminate()
+            if state["recorder"] is not None:
                 try:
-                    state["proc"].wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    state["proc"].kill()
+                    state["recorder"].stop()
+                except Exception:
+                    pass
             if state["wav_path"] and Path(state["wav_path"]).exists():
                 try:
                     os.unlink(state["wav_path"])
@@ -232,7 +337,9 @@ def run(rec_bin, whisper_bin):
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    rec_bin = check_binary("rec")
-    whisper_bin = check_binary("whisper-cli")
+    extend_path()
+    whisper_bin = find_whisper_binary()
+    check_whisper(whisper_bin)
     check_model()
-    run(rec_bin, whisper_bin)
+    check_pyaudio()
+    run(whisper_bin)
