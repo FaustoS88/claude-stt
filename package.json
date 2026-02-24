@@ -1,0 +1,30 @@
+{
+  "name": "claude-stt",
+  "version": "1.0.0",
+  "description": "Local, privacy-focused speech-to-text MCP server for Claude Code",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "mcp",
+    "speech-to-text",
+    "whisper",
+    "voice",
+    "dictation",
+    "local",
+    "privacy"
+  ],
+  "author": "FaustoS88",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.0",
+    "zod": "^3.24.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
