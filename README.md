@@ -5,8 +5,8 @@ Local, privacy-focused speech-to-text for [Claude Code](https://claude.ai/code).
 Speak into your microphone — your words appear directly in Claude Code. No copy-pasting, no cloud APIs, no audio ever leaving your device.
 
 Two modes:
-- **`/dictate`** — silence-detection, one continuous burst, auto-stops on pause
-- **PTT** — hold ⌥ to record, release to transcribe, repeat as many times as needed
+- **`/dictate`** — silence-detection, one continuous burst, auto-stops on pause. Best for quick messages.
+- **PTT** — press Enter to record, Enter to stop, read the transcript, think, record again. All segments accumulate into one message. Send everything to Claude when you're ready.
 
 ## How it works
 
@@ -16,10 +16,10 @@ Two modes:
 
 ## Requirements
 
-- macOS (Ventura 13+ recommended)
+- **macOS only** (uses `sox`, `whisper-cpp`, and `pbcopy` — Homebrew/macOS primitives)
 - [Homebrew](https://brew.sh)
 - Node.js ≥ 18
-- Python 3 (for PTT mode)
+- Python 3 (stdlib only — no extra packages needed)
 - [Claude Code CLI](https://claude.ai/code)
 
 ## Install
@@ -33,10 +33,9 @@ chmod +x install.sh
 
 The installer will:
 1. Install `sox` and `whisper-cpp` via Homebrew (if not already present)
-2. Install `pynput` via pip3 (for PTT mode)
-3. Download the `ggml-base.en.bin` whisper model (~142MB)
-4. Register the MCP server with Claude Code
-5. Install the `/dictate` skill
+2. Download the `ggml-base.en.bin` whisper model (~142MB)
+3. Register the MCP server with Claude Code
+4. Install the `/dictate` skill
 
 > **First use:** macOS will prompt for microphone access for your terminal app. Grant it once and it persists.
 
@@ -68,16 +67,15 @@ Recording starts immediately and auto-stops after ~2 seconds of silence (configu
 
 ## Mode 2 — PTT (Push-to-Talk)
 
-Best for composing longer messages where you need to think between sentences. Hold ⌥ to record, release to transcribe, repeat as many times as you need. All segments accumulate into one session. When done, tell Claude to read your dictation.
+PTT is a **message staging area**. The idea:
 
-### One-time macOS setup
+1. Speak a thought → it's transcribed, shown in the terminal, and **copied to your clipboard**
+2. Read it, decide it's good
+3. Think of more to add → record again → new segment appended, clipboard updated
+4. Repeat as many times as you need — no pressure to speak in one go
+5. When the full message is ready → **Cmd+V** in Claude Code's input field → send
 
-PTT uses a global key listener, which requires two permissions:
-
-1. **System Settings → Privacy & Security → Accessibility** → add your terminal app (iTerm2, Terminal, etc.)
-2. **System Settings → Privacy & Security → Input Monitoring** → add your terminal app
-
-Restart your terminal after granting both permissions.
+No extra packages, no macOS permissions, no wasted API calls. PTT is a standalone clipboard tool — it works with Claude Code, any browser, any text field.
 
 ### Start the PTT daemon
 
@@ -90,7 +88,8 @@ python3 ~/.claude/mcp-servers/claude-stt/ptt.py
 ### Usage
 
 ```
-Hold ⌥ (Right Option) → speak → release → transcript appended to session
+Press ENTER → recording starts
+Press ENTER → recording stops, transcribed, appended to session
 Repeat as many times as needed
 Ctrl+C → exit daemon (session is preserved)
 ```
@@ -98,29 +97,27 @@ Ctrl+C → exit daemon (session is preserved)
 Terminal output:
 
 ```
-claude-stt PTT — Hold ⌥ (Right Option) to record, release to transcribe
-Ctrl+C to exit | 'read my dictation' in Claude → calls get_session
+claude-stt PTT — press ENTER to start recording, ENTER again to stop
+Ctrl+C to exit
 
 Session: (empty)
 
-● RECORDING...
-✓ "hello how are you doing today"
+Press ENTER to record...
+● RECORDING — press ENTER to stop
+✓ "hello, I wanted to ask about the new feature"
 
-Session: hello how are you doing today
+Session (copied to clipboard): hello, I wanted to ask about the new feature
 
-● RECORDING...
-✓ "I wanted to ask about the new feature"
+Press ENTER to record...
+● RECORDING — press ENTER to stop
+✓ "specifically the authentication flow"
 
-Session: hello how are you doing today I wanted to ask about the new feature
+Session (copied to clipboard): hello, I wanted to ask about the new feature specifically the authentication flow
 ```
 
-### Reading the session in Claude Code
+### Sending to Claude
 
-When you're done recording segments, tell Claude:
-
-> "Read my dictation"
-
-Claude will call `get_session`, which returns the accumulated text and clears the session file.
+Switch to Claude Code, **Cmd+V** in the input field, hit Enter. Done — no extra API call, no extra step.
 
 ### New MCP tools (PTT)
 

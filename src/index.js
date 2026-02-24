@@ -114,10 +114,12 @@ function transcribeAudio(whisperBin, wavPath, modelPath) {
     proc.on("close", (code) => {
       clearTimeout(timeout);
       if (code === 0) {
+        // Filter out whisper hallucination tokens (emitted on silence/noise)
+        const WHISPER_ARTIFACTS = /^\[.*\]$|^\(.*\)$/;
         const text = stdout
           .split("\n")
           .map((l) => l.trim())
-          .filter((l) => l.length > 0)
+          .filter((l) => l.length > 0 && !WHISPER_ARTIFACTS.test(l))
           .join(" ")
           .trim();
         resolve(text);
