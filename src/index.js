@@ -21,7 +21,7 @@ const DEFAULT_MODEL_PATH = join(
 );
 const DEFAULT_MAX_DURATION = 30;    // seconds
 const DEFAULT_SILENCE_DURATION = 2; // seconds
-const SILENCE_THRESHOLD = "1.0%";   // sox amplitude threshold for silence detection
+const SILENCE_THRESHOLD = "0.5%";   // sox amplitude threshold for silence detection
 
 
 // ─── MCP Server ──────────────────────────────────────────────────────────────

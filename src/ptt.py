@@ -92,10 +92,13 @@ def transcribe_audio(whisper_bin, wav_path):
 # ─── Main loop ───────────────────────────────────────────────────────────────
 
 def run(rec_bin, whisper_bin):
-    session = read_session()
+    # Always start fresh — clear any leftover session from a previous run
+    if SESSION_FILE.exists():
+        SESSION_FILE.unlink()
+
     print("claude-stt PTT — press ENTER to start recording, ENTER again to stop")
-    print("Ctrl+C to exit  |  'read my dictation' in Claude → calls get_session\n")
-    print(f"Session: {session or '(empty)'}\n")
+    print("Ctrl+C to exit  |  Cmd+V anywhere to paste accumulated text\n")
+    print("Session: (empty)\n")
 
     proc = None
     wav_path = None
