@@ -2,24 +2,32 @@
 """
 claude-stt PTT daemon — Push-to-Talk mode.
 
-Press ENTER to start recording, ENTER again to stop and transcribe.
-Each segment is appended to session.txt.
-When done composing, tell Claude "read my dictation" → calls get_session MCP tool.
+Hold Right Option (⌥) to record, release to stop and transcribe.
+Each segment is appended to session.txt and copied to the clipboard.
+Paste (Cmd+V) directly into Claude Code.
+
+Commands (type in terminal):
+    c / clear   — clear session and clipboard, start fresh
+    q / quit    — exit
+    Ctrl+C      — exit
 
 Usage:
     python3 ~/.claude/mcp-servers/claude-stt/ptt.py
 
 Requirements:
     brew install sox whisper-cpp
-    (no special macOS permissions needed)
+    pip3 install pynput
+    Terminal must have Accessibility permission (System Settings > Privacy > Accessibility)
 """
 
 import os
 import sys
-import signal
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
+
+from pynput import keyboard
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
 
@@ -56,7 +64,14 @@ def copy_to_clipboard(text):
     try:
         subprocess.run(["pbcopy"], input=text.encode(), check=True)
     except Exception:
-        pass  # clipboard is best-effort — don't break the flow
+        pass
+
+def clear_clipboard():
+    """Clear the system clipboard."""
+    try:
+        subprocess.run(["pbcopy"], input=b"", check=True)
+    except Exception:
+        pass
 
 # ─── Session file helpers ─────────────────────────────────────────────────────
 
@@ -72,6 +87,14 @@ def append_session(text):
     SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
     SESSION_FILE.write_text(combined, encoding="utf-8")
     return combined
+
+def clear_session():
+    """Clear session file, clipboard, and print confirmation."""
+    if SESSION_FILE.exists():
+        SESSION_FILE.unlink()
+    clear_clipboard()
+    print("\n✓ Session cleared — clipboard emptied. Ready for a fresh start.\n")
+    print("Session: (empty)\n")
 
 # ─── Audio pipeline ──────────────────────────────────────────────────────────
 
@@ -92,71 +115,54 @@ def transcribe_audio(whisper_bin, wav_path):
 # ─── Main loop ───────────────────────────────────────────────────────────────
 
 def run(rec_bin, whisper_bin):
-    # Always start fresh — clear any leftover session from a previous run
+    # Always start fresh
     if SESSION_FILE.exists():
         SESSION_FILE.unlink()
 
-    print("claude-stt PTT — press ENTER to start recording, ENTER again to stop")
-    print("Ctrl+C to exit  |  Cmd+V anywhere to paste accumulated text\n")
+    print("claude-stt PTT — hold Right Option (⌥) to record, release to stop")
+    print("Type 'c' to clear session  |  Ctrl+C to exit")
+    print("Transcript auto-copied to clipboard → Cmd+V to paste\n")
     print("Session: (empty)\n")
 
-    proc = None
-    wav_path = None
+    # Shared state protected by a lock
+    lock = threading.Lock()
+    state = {"recording": False, "proc": None, "wav_path": None}
 
-    def cleanup(sig=None, frame=None):
-        if proc is not None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-        if wav_path and Path(wav_path).exists():
-            try:
-                os.unlink(wav_path)
-            except OSError:
-                pass
-        print("\nExiting. Session preserved in session.txt.")
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, cleanup)
-
-    while True:
-        try:
-            input("Press ENTER to record...")
-        except EOFError:
-            cleanup()
-
-        fd, wav_path = tempfile.mkstemp(suffix=".wav", prefix="claude-stt-ptt-")
+    def start_recording():
+        fd, wav = tempfile.mkstemp(suffix=".wav", prefix="claude-stt-ptt-")
         os.close(fd)
+        state["wav_path"] = wav
+        state["proc"] = record_audio(rec_bin, wav)
+        state["recording"] = True
+        print("● RECORDING — release Right Option (⌥) to stop", flush=True)
 
-        proc = record_audio(rec_bin, wav_path)
-        print("● RECORDING — press ENTER to stop")
+    def stop_and_transcribe():
+        proc = state["proc"]
+        wav = state["wav_path"]
+        state["proc"] = None
+        state["wav_path"] = None
+        state["recording"] = False
 
-        try:
-            input()
-        except EOFError:
-            cleanup()
-
+        # Stop recording
         proc.terminate()
         try:
             proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
-        proc = None
 
+        # Transcribe
         print("  Transcribing...", end="", flush=True)
         try:
-            text = transcribe_audio(whisper_bin, wav_path)
+            text = transcribe_audio(whisper_bin, wav)
         except Exception as e:
             print(f"\r✗ Transcription error: {e}   ")
             text = None
         finally:
             try:
-                os.unlink(wav_path)
+                os.unlink(wav)
             except OSError:
                 pass
-            wav_path = None
 
         if text:
             session = append_session(text)
@@ -165,6 +171,63 @@ def run(rec_bin, whisper_bin):
             print(f"\nSession (copied to clipboard): {session}\n")
         else:
             print("\r✗ (no speech detected)   \n")
+
+    def on_press(key):
+        try:
+            with lock:
+                if key == keyboard.Key.alt_r and not state["recording"]:
+                    start_recording()
+        except Exception as e:
+            print(f"\n✗ Key handler error: {e}", flush=True)
+
+    def on_release(key):
+        try:
+            with lock:
+                if key == keyboard.Key.alt_r and state["recording"]:
+                    stop_and_transcribe()
+        except Exception as e:
+            print(f"\n✗ Key handler error: {e}", flush=True)
+
+    # Start global key listener in daemon thread
+    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+    listener.daemon = True
+    listener.start()
+
+    # Main thread: read stdin for commands
+    try:
+        while True:
+            try:
+                cmd = input().strip().lower()
+            except EOFError:
+                break
+            if cmd in ("c", "clear"):
+                with lock:
+                    if state["recording"]:
+                        print("  (finish recording first)")
+                        continue
+                clear_session()
+            elif cmd in ("q", "quit", "exit"):
+                break
+            elif cmd:
+                print(f"  Unknown command: '{cmd}' — type 'c' to clear, 'q' to quit")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # Cleanup if interrupted mid-recording
+        with lock:
+            if state["proc"] is not None:
+                state["proc"].terminate()
+                try:
+                    state["proc"].wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    state["proc"].kill()
+            if state["wav_path"] and Path(state["wav_path"]).exists():
+                try:
+                    os.unlink(state["wav_path"])
+                except OSError:
+                    pass
+        listener.stop()
+        print("\nExiting. Session preserved in session.txt.")
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
